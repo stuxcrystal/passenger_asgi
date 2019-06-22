@@ -1,0 +1,1 @@
+from passenger_asgi.asyncio.main import DefaultAdapter, UVLoopAdapter
