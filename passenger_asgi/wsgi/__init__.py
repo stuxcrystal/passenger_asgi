@@ -1,0 +1,1 @@
+from passenger_asgi.wsgi.main import WSGIAdapter

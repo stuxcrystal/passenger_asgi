@@ -1,3 +1,4 @@
+import logging
 import traceback
 from typing import Awaitable, Callable, List
 from typing import Iterable, NoReturn, Optional, Union
@@ -12,7 +13,7 @@ from wsproto.connection import SERVER, ConnectionState
 from wsproto.events import Request, TextMessage, Message, BytesMessage, CloseConnection, AcceptConnection, Event
 
 
-from passenger_asgi.asgi_typing import Scope, Receive, Send, ASGI3App
+from passenger_asgi.asyncio.asgi_typing import Scope, Receive, Send, ASGI3App
 
 PullResult = Union[list, Event]
 

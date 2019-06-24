@@ -5,10 +5,7 @@ from threading import Lock, Thread
 from typing import TypeVar, Awaitable, NoReturn
 from concurrent.futures import ThreadPoolExecutor, Future as ConcFuture
 
-import setproctitle
-
-from passenger_asgi.asgi_typing import WSGIApp, Headers, WriteCallable, Scope, Receive, Send, Event
-
+from passenger_asgi.asyncio.asgi_typing import WSGIApp, Headers, WriteCallable, Scope, Receive, Send
 
 try:
     from _io import BytesIO
@@ -118,8 +115,12 @@ class WsgiContainer:
         loop = get_running_loop()
         send_sync = lambda data: asyncio.run_coroutine_threadsafe(send(data), loop=loop).result()
 
+        server = scope.get("server", ["localhost", 80])
+
         environ = {
             "REQUEST_METHOD": scope["method"],
+            "SERVER_NAME": server[0],
+            "SERVER_PORT": server[1],
             "SCRIPT_NAME": "",
             "PATH_INFO": scope["path"],
             "QUERY_STRING": scope["query_string"].decode("ascii"),

@@ -1,7 +1,5 @@
 import abc
-from typing import TYPE_CHECKING, NoReturn, Callable, Awaitable
-
-from passenger_asgi.asgi_typing import ASGI3App, WSGIApp
+from typing import TYPE_CHECKING, NoReturn, Callable, Awaitable, Any
 
 if TYPE_CHECKING:
     from passenger_asgi.passenger import Passenger, PassengerWorker
@@ -13,12 +11,16 @@ class AdapterBase(abc.ABC):
         self.wrapper = wrapper
         self.passenger = passenger
 
+    @classmethod
+    def get_type(cls) -> str:
+        return "Generic Adapter"
+
     @abc.abstractmethod
-    def wrap_wsgi(self, app: WSGIApp) -> ASGI3App:
+    def prepare_application(self, app: Any) -> Any:
         pass
 
     @abc.abstractmethod
-    def prepare(self, app: ASGI3App) -> NoReturn:
+    def prepare(self, app: Any) -> NoReturn:
         pass
 
     @abc.abstractmethod

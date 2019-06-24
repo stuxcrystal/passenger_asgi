@@ -1,28 +1,31 @@
 import os
 import sys
 import json
-import errno
-import socket
 import asyncio
+import inspect
 import logging
 
 from pathlib import Path
+from http.client import responses
 from abc import ABC, abstractmethod
-from typing import Callable, Awaitable, NoReturn, Optional
+from typing import Callable, Awaitable, NoReturn, Optional, Any
 
 from asyncio import IncompleteReadError
 from asyncio import StreamReader, StreamWriter
 from asyncio import set_event_loop_policy, get_event_loop
 from asyncio import AbstractEventLoopPolicy, DefaultEventLoopPolicy, AbstractEventLoop, start_unix_server
 
+from passenger_asgi.api import get_callbacks
 from passenger_asgi.adapter import AdapterBase
-from passenger_asgi.asyncio.lifespan import LifespanContainer
-from passenger_asgi.asgi_typing import ASGI3App, Event, WSGIApp
-from passenger_asgi.asgi_statemachine import StateMachine
-from passenger_asgi.asyncio.websocket import WebSocketMiddleware
-from passenger_asgi.asyncio.wsgi import WsgiContainer
-from passenger_asgi.session import PassengerSessionProtocol
 from passenger_asgi.passenger import Passenger, PassengerWorker
+from passenger_asgi.session import PassengerSessionProtocol, ProtocolState
+
+from passenger_asgi.asyncio.wsgi import WsgiContainer
+from passenger_asgi.asyncio.lifespan import LifespanContainer
+from passenger_asgi.asyncio.exceptions import error_middleware
+from passenger_asgi.asyncio.websocket import WebSocketMiddleware
+from passenger_asgi.asyncio.asgi_statemachine import StateMachine
+from passenger_asgi.asyncio.asgi_typing import ASGI3App, Event, Scope
 
 
 class WriteStateMachine(StateMachine):
@@ -46,7 +49,11 @@ class WriteStateMachine(StateMachine):
         else:
             self.writer.write(data)
 
-        await self.writer.drain()
+        try:
+            await self.writer.drain()
+        except ConnectionResetError:
+            self.writer = None
+            return
 
         if data is None:
             self.writer = None
@@ -56,6 +63,7 @@ class WriteStateMachine(StateMachine):
             raise ValueError("You can't send this event here.")
 
         status = event["status"]
+        status = f"{status} {responses[status]}"
         await self.try_write(f"HTTP/1.1 {status}\r\nStatus: {status}\r\nConnection: close\r\n".encode("latin-1"))
         for h, v in event.get("headers", []):
             await self.try_write(b''.join([h, b": ", v, b"\r\n"]))
@@ -86,15 +94,68 @@ class WriteStateMachine(StateMachine):
 
 
 class Connection:
+    HTTPS_VALUES = (b"on", b"1", b"true", b"yes")
 
     def __init__(self, app, reader, writer):
         self.app = app
 
-        self.protocol = PassengerSessionProtocol()
+        self.protocol = PassengerSessionProtocol(self.parse_env)
         self.reader: StreamReader = reader
         self.writer: StreamWriter = writer
 
+    def parse_env(self, list_headers):
+        d_list_headers = dict(list_headers)
+
+        headers = [(h[5:].lower().replace(b"_", b"-"), v) for h, v in list_headers if h.startswith(b"HTTP_")]
+        if b"CONTENT_LENGTH" in d_list_headers:
+            headers.append((b"content-length", d_list_headers[b"CONTENT_LENGTH"]))
+        if b"CONTENT_TYPE" in d_list_headers:
+            headers.append((b"content-type", d_list_headers[b"CONTENT_TYPE"]))
+
+        scope: Scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.1"},
+
+            "http_version": d_list_headers[b"SERVER_PROTOCOL"].split(b"/")[1].decode("latin1"),
+            "method":       d_list_headers[b"REQUEST_METHOD"].decode("latin-1"),
+            "scheme":       "https" if d_list_headers.get(b"HTTPS", b"off") in self.HTTPS_VALUES else "http",
+
+            "root_path":    d_list_headers.get(b"SCRIPT_NAME", b"").decode("latin-1"),
+            "path":         d_list_headers.get(b"PATH_INFO", b"").decode("latin-1"),
+            "raw_path":     d_list_headers.get(b"REQUEST_URI", b""),
+
+            "query_string": d_list_headers.get(b"QUERY_STRING"),
+            "headers":      headers,
+            "client":       [
+                d_list_headers.get(b"REMOTE_ADDR").decode("latin-1"),
+                int(d_list_headers.get(b"REMOTE_PORT").decode("latin-1"))
+            ],
+            "server":       [
+                d_list_headers.get(b"SERVER_NAME").decode("latin-1"),
+                int(d_list_headers.get(b"SERVER_PORT").decode("latin-1"))
+            ],
+        }
+
+        if b'CONTENT_LENGTH' in d_list_headers:
+            # We have an exact amount left.
+            _left = int(d_list_headers[b'CONTENT_LENGTH'].decode("latin-1"))
+            _state = ProtocolState.RECEIVING_DATA
+
+        elif b'HTTP_TRANSFER_ENCODING' in d_list_headers or b'UPGRADE' in d_list_headers:
+            _left = 0
+            _state = ProtocolState.RECEIVING_DATA
+
+        else:
+            _left = 0
+            _state = ProtocolState.CLOSED
+
+        return _state, _left, scope
+
     async def read_until_result(self):
+        print(self.protocol)
+        if self.protocol.is_closed():
+            return self.protocol.feed(None)
+
         while True:
             if self.reader.at_eof():
                 return self.protocol.feed(None)
@@ -104,6 +165,8 @@ class Connection:
             try:
                 if needed == 0:
                     data = await self.reader.read(1024*1024)
+                elif isinstance(needed, bytes):
+                    data = await self.reader.readuntil(b'\r\n')
                 else:
                     data = await self.reader.readexactly(needed)
 
@@ -125,7 +188,8 @@ class Connection:
             await self.writer.drain()
 
         async def receive() -> Event:
-            return await self.read_until_result()
+            result = await self.read_until_result()
+            return result
 
         send = WriteStateMachine(self.writer, scope["method"].lower() == "head")
 
@@ -144,8 +208,17 @@ class AsyncIOAdapter(AdapterBase, ABC):
         set_event_loop_policy(self.get_event_loop_policy())
         self.event_loop = get_event_loop()
 
-    def wrap_wsgi(self, app: WSGIApp) -> ASGI3App:
-        return WsgiContainer(app)
+    def prepare_application(self, application: Any) -> Any:
+        # Convert an WSGI-App to an ASGI-App if needed.
+        signature = inspect.signature(application, follow_wrapped=True)
+        if len(signature.parameters) == 2:
+            application = WsgiContainer(application)
+
+        # Convert an ASGI2-App to ASGI3
+        from asgiref.compatibility import guarantee_single_callable
+        application = guarantee_single_callable(application)
+
+        return application
 
     @abstractmethod
     def get_event_loop_policy(self) -> AbstractEventLoopPolicy:
@@ -156,6 +229,9 @@ class AsyncIOAdapter(AdapterBase, ABC):
         pass
 
     def prepare(self, app: ASGI3App) -> NoReturn:
+        for cb in get_callbacks("prepare-app"):
+            cb()
+
         self.event_loop.run_until_complete(self.prepare_async(app))
 
     @abstractmethod
@@ -183,6 +259,7 @@ class SimpleAdapter(AsyncIOAdapter, ABC):
         ##
         # Prepare the application container.
         app = WebSocketMiddleware(app)
+        app = error_middleware(app)
         self.app = app
         self.lifespan = LifespanContainer(app)
         await self.lifespan.startup()
@@ -191,23 +268,7 @@ class SimpleAdapter(AsyncIOAdapter, ABC):
         with self.passenger.run_state("SUBPROCESS_LISTEN"):
             config = self.wrapper.config
             base_path = Path(config.get("socket_dir"))
-
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-
-            for i in range(128):
-                unique_id = int.from_bytes(os.urandom(8), "big").__format__("x")
-                path = base_path / f"asgi.{unique_id}"
-                try:
-                    sock.bind(str(path))
-                except OSError as e:
-                    if e.errno == errno.EADDRINUSE:
-                        continue
-                    raise
-                else:
-                    break
-
-            else:
-                raise OSError(errno.EADDRINUSE, "Couldn't generate a server-socket.")
+            sock, path = self.passenger.find_unix_socket(base_path)
 
             self.logger.debug(f"Publishing socket: {path}")
             with open(self.passenger.spawn_dir / "response" / "properties.json", "w") as f:
@@ -238,11 +299,20 @@ class SimpleAdapter(AsyncIOAdapter, ABC):
 
 
 class DefaultAdapter(SimpleAdapter):
+
+    @classmethod
+    def get_type(cls) -> str:
+        return "ASGI-Worker"
+
     def get_event_loop_policy(self) -> AbstractEventLoopPolicy:
         return DefaultEventLoopPolicy()
 
 
 class UVLoopAdapter(SimpleAdapter):
+    @classmethod
+    def get_type(cls) -> str:
+        return "ASGI-Worker (uvloop)"
+
     def get_event_loop_policy(self) -> AbstractEventLoopPolicy:
         import uvloop
         return uvloop.EventLoopPolicy()

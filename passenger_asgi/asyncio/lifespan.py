@@ -3,8 +3,8 @@ from typing import Any, Tuple
 from asyncio import sleep
 from asyncio import get_running_loop
 
-from passenger_asgi.asgi_typing import Event
-from passenger_asgi.asgi_statemachine import StateMachine
+from passenger_asgi.asyncio.asgi_typing import Event
+from passenger_asgi.asyncio.asgi_statemachine import StateMachine
 
 
 class ReceiveStateMachine(StateMachine):
